@@ -603,6 +603,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return None
         if envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get():
             return None
+        # Attention variants capture the same token bucket more than once.
+        # Every graph must read the buffers refreshed by replay staging.
+        if num_tokens in self._captured_ragged_layouts:
+            return self._captured_ragged_layouts[num_tokens]
         from sglang.srt.speculative.ragged_verify import (
             RaggedVerifyLayout,
             build_capture_verify_lens,
