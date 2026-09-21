@@ -8,15 +8,17 @@ Covers the contract behind ``skip_attn_backend_init`` deprecation:
   * the deprecated kwarg shim maps explicit values onto the marker
     (mapped, not ignored) and warns once per process
 
-Pure dataclass logic — CPU only.
+Plan records and backend-independent post-padding contracts — CPU only.
 """
 
 import unittest
 import warnings
+from contextlib import contextmanager
 
 import torch
 
 import sglang.srt.model_executor.forward_batch_info as fbi
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -93,6 +95,44 @@ class TestForwardMetadataPlanRecord(CustomTestCase):
         fb.mark_forward_metadata_ready(replan_equivalent=True)
         self.assertFalse(fb.needs_forward_metadata_init())
         self.assertEqual(fb.forward_metadata_planned_bs, 4)
+
+    def test_matched_plan_and_empty_batch_need_no_adapter(self):
+        for bs in (0, 2):
+            fb = _make_batch(bs=bs, num_tokens=bs)
+            fb.mark_forward_metadata_ready()
+            with AttentionBackend().use_forward_metadata_after_padding(fb):
+                pass
+
+    def test_wrapper_checks_all_children_and_restores_on_failure(self):
+        calls = []
+
+        class Adapter(AttentionBackend):
+            @contextmanager
+            def _use_padded_forward_metadata(self, fb):
+                calls.append("enter")
+                try:
+                    yield
+                finally:
+                    calls.append("exit")
+
+        wrapper = AttentionBackend()
+        wrapper.attn_backend_list = [Adapter(), AttentionBackend()]
+        fb = _make_batch()
+        fb.mark_forward_metadata_ready()
+        fb.batch_size = 4
+        fb.input_ids = fb.input_ids.new_zeros(4)
+        with self.assertRaises(RuntimeError):
+            with wrapper.use_forward_metadata_after_padding(fb):
+                self.fail("an unsupported child must fail before the body")
+        self.assertEqual(calls, ["enter", "exit"])
+
+    def test_shrinking_after_plan_is_rejected(self):
+        fb = _make_batch()
+        fb.mark_forward_metadata_ready()
+        fb.input_ids = fb.input_ids[:1]
+        with self.assertRaisesRegex(RuntimeError, "Invalid attention pre-plan"):
+            with AttentionBackend().use_forward_metadata_after_padding(fb):
+                self.fail("shrinking cannot be treated as padding")
 
 
 class TestDeprecatedSkipKwargShim(CustomTestCase):
