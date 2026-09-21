@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC
+from contextlib import ExitStack, contextmanager
 from enum import Enum
 from typing import TYPE_CHECKING, Iterable, Optional
 
@@ -92,6 +93,58 @@ class AttentionBackend(ABC):
         """
         self.init_forward_metadata_out_graph(forward_batch)
         self.init_forward_metadata_in_graph(forward_batch)
+
+    @contextmanager
+    def use_forward_metadata_after_padding(self, forward_batch: ForwardBatch):
+        """Validate a skipped pre-plan against the final eager batch shape.
+
+        Called before the model (including fused KV writes), only when eager
+        did not initialize metadata itself. Graph runners own their metadata.
+        Non-equivalent pre-plans must not be replaced by a generic re-plan.
+        A backend may instead install a scoped, padding-aware execution view.
+        """
+        if not forward_batch.forward_metadata_shape_changed():
+            yield
+            return
+
+        real_bs = forward_batch.forward_metadata_planned_bs
+        real_tokens = forward_batch.forward_metadata_planned_num_tokens
+        if (
+            real_bs is None
+            or real_tokens is None
+            or real_bs < 0
+            or real_tokens < 0
+            or forward_batch.batch_size < real_bs
+            or forward_batch._forward_num_tokens() < real_tokens
+        ):
+            raise RuntimeError("Invalid attention pre-plan extents after padding")
+
+        with ExitStack() as stack:
+            if self.attn_backend_list is not None:
+                for backend in self.attn_backend_list:
+                    stack.enter_context(
+                        backend.use_forward_metadata_after_padding(forward_batch)
+                    )
+            else:
+                stack.enter_context(self._use_padded_forward_metadata(forward_batch))
+            yield
+
+    def _use_padded_forward_metadata(self, forward_batch: ForwardBatch):
+        """Opt in only after auditing every row-indexed read and KV write.
+
+        Implementations must preserve the real pre-plan and restore temporary
+        state on exit, including exceptions. Unknown backends fail before the
+        model can launch kernels using stale metadata.
+        """
+        raise RuntimeError(
+            f"{type(self).__name__} cannot reuse attention metadata after padding: "
+            f"planned (requests={forward_batch.forward_metadata_planned_bs}, "
+            f"tokens={forward_batch.forward_metadata_planned_num_tokens}), "
+            f"final (requests={forward_batch.batch_size}, "
+            f"tokens={forward_batch._forward_num_tokens()}). "
+            "Implement a padding-aware metadata scope or mark the pre-plan "
+            "replan_equivalent=True only if re-planning is equivalent."
+        )
 
     def init_forward_metadata_out_graph(
         self,

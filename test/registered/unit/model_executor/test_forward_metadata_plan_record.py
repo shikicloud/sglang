@@ -68,6 +68,22 @@ class TestForwardMetadataPlanRecord(CustomTestCase):
         fb.input_ids = torch.zeros(6, dtype=torch.long)  # token drift
         self.assertTrue(fb.needs_forward_metadata_init())
 
+    def test_input_embeds_determine_the_planned_token_extent(self):
+        fb = _make_batch()
+        fb.input_embeds = torch.zeros(3, 8)
+        fb.mark_forward_metadata_ready(replan_equivalent=True)
+        self.assertEqual(fb.forward_metadata_planned_num_tokens, 3)
+        fb.input_embeds = torch.zeros(4, 8)
+        self.assertTrue(fb.forward_metadata_shape_changed())
+        self.assertTrue(fb.needs_forward_metadata_init())
+
+    def test_non_equivalent_drift_requires_backend_validation(self):
+        fb = _make_batch()
+        fb.mark_forward_metadata_ready()
+        fb.input_ids = torch.zeros(4, dtype=torch.long)
+        self.assertTrue(fb.forward_metadata_shape_changed())
+        self.assertFalse(fb.needs_forward_metadata_init())
+
     def test_remark_re_records_padded_shapes(self):
         # Per-step loops re-mark each plan; the re-mark must snapshot padded shapes.
         fb = _make_batch(bs=2)

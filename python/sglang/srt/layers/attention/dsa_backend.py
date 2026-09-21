@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from typing import (
     TYPE_CHECKING,
     Dict,
@@ -1841,6 +1842,112 @@ class DeepseekSparseAttnBackend(
 
         self.forward_metadata = metadata
 
+    # Eager-only attention view. Indexer and per-step plans keep forward_metadata.
+    _padded_attention_metadata: Optional[DSAMetadata] = None
+
+    def _get_attention_metadata(self) -> DSAMetadata:
+        if self._padded_attention_metadata is not None:
+            return self._padded_attention_metadata
+        return self.forward_metadata
+
+    @contextmanager
+    def _use_padded_forward_metadata(self, forward_batch: ForwardBatch):
+        mode = forward_batch.forward_mode
+        # These modes use one sparse attention row per query token. Dense
+        # prefill, CP, pooled indexing and offloaded KV need separate audits.
+        if (
+            not (
+                mode.is_decode() or mode.is_draft_extend_v2() or mode.is_target_verify()
+            )
+            or is_cp_active(forward_batch)
+            or self.dsa_index_kpool != 1
+            or self.hisparse_coordinator is not None
+            or self.dsa_decode_impl
+            not in (
+                "flashmla_sparse",
+                "flashmla_kv",
+                "flashinfer_sparse_mla",
+                "fa3",
+                "triton",
+                "tilelang",
+                "trtllm",
+            )
+        ):
+            super()._use_padded_forward_metadata(forward_batch)
+
+        metadata = self.forward_metadata
+        real_tokens = forward_batch.forward_metadata_planned_num_tokens
+        real_bs = forward_batch.forward_metadata_planned_bs
+        num_tokens = forward_batch._forward_num_tokens()
+        if metadata is None:
+            raise RuntimeError("DSA attention pre-plan is missing")
+
+        def require_rows(name, tensor, rows):
+            if tensor is None or tensor.shape[0] < rows:
+                raise RuntimeError(
+                    f"DSA {name} does not cover the real attention extent ({rows} rows)"
+                )
+
+        # Never turn an incomplete real plan into apparently valid padding.
+        require_rows(
+            "cache_seqlens",
+            metadata.cache_seqlens_int32,
+            real_tokens if mode.is_decode() else real_bs,
+        )
+        require_rows("cu_seqlens_q", metadata.cu_seqlens_q, real_bs + 1)
+        require_rows("expanded seqlens", metadata.dsa_seqlens_expanded, real_tokens)
+        require_rows("DSA seqlens", metadata.dsa_cache_seqlens_int32, real_tokens)
+        require_rows("out_cache_loc", forward_batch.out_cache_loc, num_tokens)
+        if metadata.page_table_1 is not None:
+            require_rows("page table", metadata.page_table_1, real_tokens)
+        elif not self.use_fused_topk:
+            raise RuntimeError("DSA unfused attention pre-plan needs a page table")
+        if self.dsa_decode_impl == "flashmla_kv":
+            if metadata.flashmla_metadata is None:
+                raise RuntimeError("DSA FlashMLA pre-plan is missing")
+            require_rows(
+                "num_splits", metadata.flashmla_metadata.num_splits, real_tokens + 1
+            )
+
+        def pad_rows(tensor):
+            if tensor is None:
+                return None
+            result = tensor.new_zeros((num_tokens, *tensor.shape[1:]))
+            result[:real_tokens].copy_(tensor[:real_tokens])
+            return result
+
+        seqlens = pad_rows(metadata.dsa_cache_seqlens_int32)
+        # Rebuild only the attention schedule. In particular, DeepGEMM's
+        # paged_mqa_schedule_metadata and context_lens remain at the true B.
+        attention_metadata = replace(
+            metadata,
+            page_table_1=pad_rows(metadata.page_table_1),
+            cache_seqlens_int32=(
+                pad_rows(metadata.cache_seqlens_int32)
+                if mode.is_decode()
+                else metadata.cache_seqlens_int32
+            ),
+            dsa_cache_seqlens_int32=seqlens,
+            dsa_cu_seqlens_q=self.get_device_int32_arange(num_tokens + 1),
+            dsa_cu_seqlens_k=compute_cu_seqlens(seqlens),
+            dsa_extend_seq_lens_list=(
+                metadata.dsa_extend_seq_lens_list[:real_bs]
+                if metadata.dsa_extend_seq_lens_list is not None
+                else None
+            ),
+            flashmla_metadata=(
+                self._compute_flashmla_metadata(seqlens, seq_len_q=1)
+                if metadata.flashmla_metadata is not None
+                else None
+            ),
+        )
+        previous = self._padded_attention_metadata
+        self._padded_attention_metadata = attention_metadata
+        try:
+            yield
+        finally:
+            self._padded_attention_metadata = previous
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1860,7 +1967,7 @@ class DeepseekSparseAttnBackend(
     ) -> torch.Tensor:
 
         causal = not layer.is_cross_attention
-        metadata = self.forward_metadata
+        metadata = self._get_attention_metadata()
         assert causal, "DSA is causal only"
 
         dsa_impl = (
@@ -2189,7 +2296,7 @@ class DeepseekSparseAttnBackend(
     ) -> torch.Tensor:
 
         causal = not layer.is_cross_attention
-        metadata = self.forward_metadata
+        metadata = self._get_attention_metadata()
         assert causal, "DSA is causal only"
 
         dsa_impl = self._resolve_kpool_tail_backend(topk_indices, self.dsa_decode_impl)
@@ -3317,7 +3424,7 @@ class DeepseekSparseAttnBackend(
         """Forward using TRT-LLM sparse MLA kernel."""
         import flashinfer.decode
 
-        metadata = self.forward_metadata
+        metadata = self._get_attention_metadata()
 
         # The BF16 no-RoPE path passes a zero-width q_rope tensor.
         merge_query = q_rope is not None and self.qk_rope_head_dim > 0

@@ -46,6 +46,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
+    get_attn_backend,
     get_req_to_token_pool,
     get_token_to_kv_pool,
 )
@@ -251,7 +252,8 @@ class EagerRunner(BaseRunner):
         attn_backend, pdmux_ctx = self._resolve_decode_pdmux()
         if not enable_pdmux:
             forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
-        if forward_batch.needs_forward_metadata_init():
+        metadata_initialized = forward_batch.needs_forward_metadata_init()
+        if metadata_initialized:
             if hasattr(model_runner.model, "prepare_forward_batch"):
                 # Prepare model-specific attention metadata before planning,
                 # e.g. Moss-VL's prefill cross-attention custom mask.
@@ -262,7 +264,17 @@ class EagerRunner(BaseRunner):
 
         ctx = device_timer_ctx(model_runner.device_timer, "decode")
 
-        with ctx, pdmux_ctx:
+        with (
+            ctx,
+            pdmux_ctx,
+            (
+                contextlib.nullcontext()
+                if metadata_initialized
+                else get_attn_backend().use_forward_metadata_after_padding(
+                    forward_batch
+                )
+            ),
+        ):
             return model_runner.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
@@ -291,11 +303,12 @@ class EagerRunner(BaseRunner):
         # no static metadata load to fill the gap.  Re-plan target verify from
         # the final batch every time; eager metadata is intentionally derived
         # directly from the live ``spec_info`` tensors.
-        if (
+        metadata_initialized = (
             forward_batch.needs_forward_metadata_init()
             or cp_active
             or forward_batch.forward_mode.is_target_verify()
-        ):
+        )
+        if metadata_initialized:
             if model_runner.ps.attn_dcp_size > 1 and hasattr(
                 model_runner.model, "prepare_context_parallel_metadata_for_dcp"
             ):
@@ -338,7 +351,16 @@ class EagerRunner(BaseRunner):
             if forward_batch.forward_mode.is_target_verify()
             else "extend"
         )
-        with device_timer_ctx(model_runner.device_timer, category):
+        with (
+            device_timer_ctx(model_runner.device_timer, category),
+            (
+                contextlib.nullcontext()
+                if metadata_initialized
+                else get_attn_backend().use_forward_metadata_after_padding(
+                    forward_batch
+                )
+            ),
+        ):
             pcg_runner = model_runner.prefill_cuda_graph_runner
             if (
                 _is_hip

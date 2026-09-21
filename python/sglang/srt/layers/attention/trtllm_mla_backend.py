@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import math
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Union
 
@@ -809,6 +810,40 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             if self.kv_index_translator.is_translating
             else forward_batch.out_cache_loc
         )
+
+    @contextmanager
+    def _use_padded_forward_metadata(self, forward_batch: ForwardBatch):
+        # Preserve the existing decode backstop, but run it before fused KV
+        # writes in the model. This is a backend-local re-plan, not permission
+        # to replace a multi-step wrapper's plan with the runner's backend.
+        if (
+            not forward_batch.forward_mode.is_decode()
+            or forward_batch._forward_num_tokens() != forward_batch.batch_size
+            or self._kv_shard_pool is not None
+        ):
+            super()._use_padded_forward_metadata(forward_batch)
+        previous = self.forward_decode_metadata
+        previous_batch = getattr(forward_batch, "decode_trtllm_mla_metadata", None)
+        previous_loc = self._decode_kernel_loc
+        metadata = previous_batch or previous
+        real_bs = forward_batch.forward_metadata_planned_bs
+        if (
+            metadata is None
+            or metadata.block_kv_indices is None
+            or metadata.block_kv_indices.shape[0] < real_bs
+            or (
+                metadata.seq_lens_k is not None
+                and metadata.seq_lens_k.shape[0] < real_bs
+            )
+        ):
+            raise RuntimeError("TRTLLM MLA metadata does not cover the real requests")
+        try:
+            self.init_forward_metadata(forward_batch)
+            yield
+        finally:
+            self.forward_decode_metadata = previous
+            forward_batch.decode_trtllm_mla_metadata = previous_batch
+            self._decode_kernel_loc = previous_loc
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""

@@ -754,9 +754,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         """
         self.forward_metadata_ready = True
         self.forward_metadata_planned_bs = self.batch_size
-        self.forward_metadata_planned_num_tokens = (
-            self.input_ids.shape[0] if self.input_ids is not None else 0
-        )
+        self.forward_metadata_planned_num_tokens = self._forward_num_tokens()
         self.forward_metadata_replan_equivalent = replan_equivalent
 
     def needs_forward_metadata_init(self) -> bool:
@@ -767,17 +765,21 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         the re-plan safe (replan_equivalent). This runs after
         prepare_mlp_sync_batch in _forward_raw, so the re-plan sees the
         padded (final) shapes. Sites that cannot opt in (multi-step
-        wrapper plans etc.) keep today's behavior: marked stays skipped,
-        backends' defensive checks remain the backstop.
+        wrapper plans etc.) skip re-planning, but eager execution must enter
+        the backend's use_forward_metadata_after_padding scope before running
+        the model. That scope either adapts the plan or rejects stale shapes.
         """
         if not self.forward_metadata_ready:
             return True
         if not self.forward_metadata_replan_equivalent:
             return False
-        num_tokens = self.input_ids.shape[0] if self.input_ids is not None else 0
-        return (
+        return self.forward_metadata_shape_changed()
+
+    def forward_metadata_shape_changed(self) -> bool:
+        """Compare final physical extents with the pre-planner's real extents."""
+        return self.forward_metadata_ready and (
             self.batch_size != self.forward_metadata_planned_bs
-            or num_tokens != self.forward_metadata_planned_num_tokens
+            or self._forward_num_tokens() != self.forward_metadata_planned_num_tokens
         )
 
     def apply_deprecated_skip_attn_backend_init(
@@ -1812,7 +1814,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         the model counts it for its SP gate."""
         if self.input_embeds is not None:
             return self.input_embeds.shape[0]
-        return self.input_ids.shape[0]
+        return self.input_ids.shape[0] if self.input_ids is not None else 0
 
     def prepare_attn_tp_scatter_input(self, model_runner: ModelRunner):
         from sglang.srt.layers.communicator import get_attn_tp_context
