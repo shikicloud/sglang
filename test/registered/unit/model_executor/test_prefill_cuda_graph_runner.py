@@ -1,4 +1,4 @@
-"""CPU coverage for chunked-prefix Full prefill CUDA-graph state."""
+"""CPU coverage for Full and breakable prefill CUDA-graph state."""
 
 import unittest
 from types import SimpleNamespace
@@ -8,6 +8,7 @@ import torch
 
 import sglang.srt.model_executor.model_runner_components.cuda_graph_setup as graph_setup
 import sglang.srt.model_executor.runner.prefill_cuda_graph_runner as runner_module
+from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
@@ -24,11 +25,68 @@ from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    set_tc_piecewise_forward_context,
+)
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=21, suite="base-a-test-cpu")
+
+
+KV_LORA_RANK = 4
+ROPE_DIM = 2
+
+
+def _dcp_metadata(num_tokens):
+    return DecodeContextParallelMetadata(
+        dcp_kv_indptr=torch.zeros(2, dtype=torch.int32),
+        dcp_kv_buffer=torch.zeros((num_tokens, 1, KV_LORA_RANK + ROPE_DIM)),
+        dcp_kv_indices=torch.arange(num_tokens, dtype=torch.int32),
+        dcp_local_prefix_kv_indices=torch.zeros(0, dtype=torch.int32),
+        dcp_extend_prefix_lens_sum=0,
+    )
+
+
+def _make_graph_batch(num_tokens, prefix_lens):
+    return SimpleNamespace(
+        batch_size=len(prefix_lens),
+        input_ids=torch.zeros(num_tokens, dtype=torch.int64),
+        input_embeds=None,
+        replace_embeds=None,
+        forward_mode=SimpleNamespace(is_target_verify=lambda: False),
+        capture_hidden_mode=CaptureHiddenMode.NULL,
+        global_num_tokens_cpu=None,
+        dp_prefill_cuda_graph_max_prefix_len=0,
+        return_logprob=False,
+        extend_prefix_lens_cpu=prefix_lens,
+        extend_prefix_lens=torch.tensor(prefix_lens),
+        seq_lens=torch.tensor([num_tokens]),
+        extend_seq_lens=torch.tensor([num_tokens]),
+        req_pool_indices=torch.zeros(1, dtype=torch.int64),
+        seq_lens_sum=num_tokens,
+        attn_dcp_metadata=None,
+    )
+
+
+def _make_graph_runner(*, dcp_active=False, capture_tokens=8):
+    runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+    runner._capture_req_slots = 4
+    runner.enable_lora = False
+    runner.capture_hidden_mode = CaptureHiddenMode.NULL
+    runner.max_context_size = None
+    runner.max_num_tokens = 32
+    runner.capture_num_tokens = [capture_tokens]
+    runner.backend = SimpleNamespace()
+    runner.prefill_backend_name = Backend.BREAKABLE
+    runner.has_mha_companion_layers = False
+    runner._is_full_backend = False
+    runner._capture_chunked_prefix = False
+    runner.use_captured_attn_metadata = False
+    runner._dcp_extend_active = dcp_active
+    runner._dcp_kv_buffers = {}
+    return runner
 
 
 class _FakeAttentionBackend:
@@ -550,32 +608,11 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         )
 
     def test_prefix_gate_only_applies_to_chunked_prefix_variant(self):
-        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
-        runner._dcp_extend_active = False
-        runner._capture_req_slots = 4
-        runner.enable_lora = False
-        runner.capture_hidden_mode = CaptureHiddenMode.NULL
-        runner.max_num_tokens = 32
-        runner.capture_num_tokens = [4]
-        runner.max_context_size = None
-        runner.backend = SimpleNamespace()
+        runner = _make_graph_runner(capture_tokens=4)
         runner.prefill_backend_name = Backend.FULL
-        runner.has_mha_companion_layers = False
         runner._prefix_chunk_len = 2
         runner._prefix_capture_variants = (1, 2, 4)
-
-        forward_batch = SimpleNamespace(
-            batch_size=1,
-            input_ids=torch.zeros(4, dtype=torch.int64),
-            input_embeds=None,
-            replace_embeds=None,
-            forward_mode=SimpleNamespace(is_target_verify=lambda: False),
-            capture_hidden_mode=CaptureHiddenMode.NULL,
-            global_num_tokens_cpu=None,
-            dp_prefill_cuda_graph_max_prefix_len=0,
-            return_logprob=False,
-            extend_prefix_lens_cpu=[8],
-        )
+        forward_batch = _make_graph_batch(4, [8])
 
         # Prefix hits in BCG/TC-piecewise and ordinary non-MLA FullCG use the
         # normal graph topology and must retain their existing eligibility.
@@ -604,6 +641,88 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         )
         forward_batch.extend_prefix_lens_cpu = [9, 1]
         self.assertFalse(runner.can_run_graph(forward_batch))
+
+
+class TestDcpPrefillCudaGraph(CustomTestCase):
+    """Replay uses live metadata and the captured bucket-sized gather buffer."""
+
+    def test_prefix_hits_stay_eager_under_dcp(self):
+        fresh = _make_graph_batch(8, [0])
+        prefix_hit = _make_graph_batch(8, [4])
+        self.assertTrue(_make_graph_runner(dcp_active=False).can_run_graph(prefix_hit))
+        runner = _make_graph_runner(dcp_active=True)
+        self.assertTrue(runner.can_run_graph(fresh))
+        self.assertFalse(runner.can_run_graph(prefix_hit))
+
+    def test_replay_reuses_the_captured_gather_buffer(self):
+        runner = _make_graph_runner(dcp_active=True)
+        captured = torch.full((8, 1, KV_LORA_RANK + ROPE_DIM), 7.0)
+        runner._dcp_kv_buffers[ShapeKey(size=8)] = captured
+        planned = []
+
+        def plan(*args):
+            planned.append(args)
+            return _dcp_metadata(num_tokens=5)
+
+        attn_backend = SimpleNamespace(
+            req_to_token_pool=SimpleNamespace(req_to_token=torch.zeros((1, 8))),
+            token_to_kv_pool=SimpleNamespace(
+                get_kv_buffer_shape=lambda: (torch.Size([64, 1, 6]), None)
+            ),
+            init_forward_metadata=lambda batch: None,
+            prepare_prefill_shared_read_snapshot=lambda batch, num_qo_tokens: None,
+        )
+        runner.model_runner = SimpleNamespace(
+            attn_backend=attn_backend,
+            model=SimpleNamespace(prepare_context_parallel_metadata_for_dcp=plan),
+            kv_cache_dtype=torch.float32,
+            device="cpu",
+        )
+        live = _make_graph_batch(5, [0])
+        static = _make_graph_batch(8, [0])
+        runner._prepare_forward_metadata_for_replay(
+            live, static, shape_key=ShapeKey(size=8)
+        )
+
+        self.assertEqual(len(planned), 1)
+        self.assertIs(static.attn_dcp_metadata, live.attn_dcp_metadata)
+        # Live indices, captured (bucket-sized) buffer.
+        self.assertIs(static.attn_dcp_metadata.dcp_kv_buffer, captured)
+        self.assertEqual(static.attn_dcp_metadata.dcp_kv_indices.numel(), 5)
+
+    def test_gather_writes_the_forward_context_batch(self):
+        from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
+            bcg_dcp_extend_kv_gather,
+        )
+
+        capture_batch = _make_graph_batch(8, [0])
+        capture_batch.attn_dcp_metadata = _dcp_metadata(8)
+        live_batch = _make_graph_batch(8, [0])
+        live_batch.attn_dcp_metadata = _dcp_metadata(8)
+        k_nope = torch.ones((8, 1, KV_LORA_RANK))
+        k_pe = torch.full((8, 1, ROPE_DIM), 2.0)
+        with set_tc_piecewise_forward_context(
+            live_batch,
+            attention_layers=[],
+            quant_config=None,
+            moe_layers=[],
+            moe_fusions=[],
+        ):
+            # Replay re-supplies the capture-time batch as the argument.
+            bcg_dcp_extend_kv_gather(
+                None, None, capture_batch, KV_LORA_RANK, k_nope, k_pe
+            )
+        self.assertTrue(
+            torch.all(
+                live_batch.attn_dcp_metadata.dcp_kv_buffer[..., :KV_LORA_RANK] == 1.0
+            )
+        )
+        self.assertTrue(
+            torch.all(
+                live_batch.attn_dcp_metadata.dcp_kv_buffer[..., KV_LORA_RANK:] == 2.0
+            )
+        )
+        self.assertTrue(torch.all(capture_batch.attn_dcp_metadata.dcp_kv_buffer == 0.0))
 
 
 if __name__ == "__main__":
